@@ -12,25 +12,31 @@ A full O(n*m) pairwise comparison is infeasible, so we use *blocking*:
 for each Source-1 entity we generate a small set of candidate IDs from
 Source-2/3 that are plausible matches, using cheap key-based lookup.
 
-Strategy - four complementary blocking keys per record
--------------------------------------------------------
-BK1  country + first 4 chars of name_clean
-       -> "us_gene"   captures same-country, same-prefix records
-BK2  country + first significant token of name_clean
-       -> "us_general"  looser than BK1, catches prefix mismatches
-BK3  first 5 chars of name_clean  (no country)
-       -> "gener"   bridges records that differ only in country field
-BK4  sorted two most significant tokens of name_clean
-       -> "design_general"  catches word-order transpositions
+Strategy - complementary blocking keys per record
+---------------------------------------------------
+Name-based keys (when name_clean has >= 3 chars):
+  BK1  c3:  country + first 3 chars of name_clean  (broad recall)
+  BK2  c5:  country + first 5 chars of name_clean  (precision)
+  BK3  ct:  country + first token with >= 4 chars   (relaxed token key)
+  BK4  p6:  first 6 chars of name_clean, no country (cross-country bridge)
+  BK5  st:  sorted significant tokens (length >= 3)  (word-order invariant)
+  BK6  ph:  country + Soundex(first token)           (phonetic / spelling variants)
 
-All four keys are generated from NORMALIZED text (name_clean, country_clean)
-so that "Inc.", "inc", "INC" all map to the same token after normalize.py runs.
+Address key for ALL entities (noisy-name backup):
+  BK7  aa:  country + first 4 chars of address_clean
+
+Fallback keys (when name_clean is empty or < 3 chars, e.g. Hindi/Devanagari):
+  BK8  ca:  country + first 6 chars of address_clean
+  BK9  at:  country + first significant token of address_clean (>= 5 chars)
+  BK10 ap:  first 7 chars of address_clean (country-agnostic)
+
+All keys generated from NORMALIZED text so abbreviations and casing are
+handled uniformly.
 
 Safeguard
 ---------
-Very common blocking keys (e.g. a 4-char prefix shared by thousands of
-generic company names) can make candidate lists explode.  Each key bucket
-is capped at MAX_CANDIDATES_PER_KEY so that runaway keys are suppressed.
+Each key bucket is capped at MAX_CANDIDATES_PER_KEY to suppress runaway
+hot keys (generic prefixes shared by thousands of company names).
 
 Output
 ------
@@ -46,6 +52,12 @@ from collections import defaultdict
 
 import pandas as pd
 from tqdm import tqdm
+
+try:
+    import jellyfish
+    _SOUNDEX_AVAILABLE = True
+except ImportError:
+    _SOUNDEX_AVAILABLE = False
 
 # Allow running as: python src/blocking.py (from project root)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -66,19 +78,19 @@ OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "output")
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, "candidate_pairs.tsv")
 
 # Cap the number of entity IDs stored per blocking key.
-# Keys with more hits than this are effectively stop-words (e.g., a 4-char
-# prefix shared by thousands of generic names) and add noise without recall gain.
-MAX_CANDIDATES_PER_KEY = 150
+# Keys with more hits than this are effectively stop-words and add noise.
+MAX_CANDIDATES_PER_KEY = 180
 
 
 # ---------------------------------------------------------------------------
 # Blocking key generation
 # ---------------------------------------------------------------------------
 
-def _first_significant_token(tokens: list[str], min_len: int = 2) -> str:
+def _first_significant_token(tokens: list[str], min_len: int = 5) -> str:
     """
     Return the first token that is at least min_len characters long.
-    Falls back to the very first token if none meets the threshold.
+    Returns "" if no token meets the threshold (does NOT fall back to
+    short tokens — we want selectivity).
 
     Parameters
     ----------
@@ -87,21 +99,22 @@ def _first_significant_token(tokens: list[str], min_len: int = 2) -> str:
 
     Returns
     -------
-    str  (empty string if tokens is empty)
+    str  (empty string if no qualifying token found)
     """
     for tok in tokens:
         if len(tok) >= min_len:
             return tok
-    return tokens[0] if tokens else ""
+    return ""
 
 
-def _sorted_two_tokens(tokens: list[str], min_len: int = 3) -> str:
+def _sorted_significant_tokens(tokens: list[str], min_len: int = 3) -> str:
     """
-    Return a canonical string built from the two most significant tokens,
+    Return a canonical string built from ALL significant tokens (length >= min_len),
     sorted alphabetically to handle word-order variations.
 
-    e.g. tokens = ["general", "design", "innovations"]
-         -> sorted(["general", "design"]) -> "design_general"
+    e.g. tokens = ["general", "design", "innovations", "llc"]
+         significant (>=3) = ["general", "design", "innovations", "llc"]
+         -> sorted -> "design_general_innovations_llc"
 
     Parameters
     ----------
@@ -112,15 +125,24 @@ def _sorted_two_tokens(tokens: list[str], min_len: int = 3) -> str:
     -------
     str  joined with "_", or "" if fewer than 2 significant tokens
     """
-    significant = [t for t in tokens if len(t) >= min_len]
-    # Take first 2 significant tokens (preserves order before sorting)
-    pair = significant[:2]
-    if len(pair) < 2:
-        # Fall back to first 2 tokens of any length
-        pair = tokens[:2]
-    if len(pair) < 2:
+    significant = sorted(t for t in tokens if len(t) >= min_len)
+    if len(significant) < 2:
         return ""
-    return "_".join(sorted(pair))
+    return "_".join(significant)
+
+
+def _soundex_key(token: str) -> str:
+    """
+    Return the Soundex code for a token, or "" if unavailable/non-Latin.
+    Uses jellyfish if installed; degrades gracefully to "" otherwise.
+    """
+    if not _SOUNDEX_AVAILABLE or not token:
+        return ""
+    try:
+        code = jellyfish.soundex(token)
+        return code if code else ""
+    except Exception:
+        return ""
 
 
 def generate_keys(
@@ -136,72 +158,96 @@ def generate_keys(
 
     Key design
     ----------
-    BK1  c5:  country + first 5 chars of name_clean
-               More selective than 4 chars; still catches short variations.
-    BK2  ct:  country + first significant token (min length 5)
-               Skips short common words (e.g. "ram", "new", "sri", "the")
-               that previously created mega-buckets of 10k+ candidates.
-    BK3  p6:  first 6 chars of name_clean (no country)
-               Country-agnostic bridge; helps cross-country matches.
-    BK4  st:  sorted two most significant tokens (min length 4)
-               Catches word-order transpositions in business names.
-    BK5  ca:  country + first 6 chars of address_clean  (FALLBACK ONLY)
-               Applied only when name_clean is empty (e.g. Hindi/Devanagari
-               names that are stripped to "" after normalization).
-               Recovers those records using address similarity instead.
+    Name-based keys (generated when name_clean has >= 3 chars):
+      BK1  c3:  country + first 3 chars of name_clean  (broad, high-recall)
+      BK2  c5:  country + first 5 chars of name_clean  (selective, high-precision)
+      BK3  ct:  country + first token with >= 4 chars  (relaxed from >=5)
+      BK4  p6:  first 6 chars of name_clean, no country (cross-country bridge)
+      BK5  st:  sorted significant tokens (all tokens >= 3 chars, word-order invariant)
+      BK6  ph:  country + Soundex(first token) (phonetic/spelling-variant matching)
+
+    Address key for ALL entities (noisy-name backup):
+      BK7  aa:  country + first 4 chars of address_clean
+
+    Address-based fallback keys (only when name_clean is empty or < 3 chars,
+    e.g. Hindi/Devanagari names stripped to "" after normalization):
+      BK8  ca:  country + first 6 chars of address_clean
+      BK9  at:  country + first significant token of address_clean (>= 5 chars)
+      BK10 ap:  first 7 chars of address_clean (country-agnostic)
 
     Parameters
     ----------
     name_clean    : str  cleaned business name (from normalize.py)
     country_clean : str  cleaned country string
-    address_clean : str  cleaned address (used only as fallback)
+    address_clean : str  cleaned address (always used for BK7; also fallback)
 
     Returns
     -------
     list[str]  deduplicated list of blocking key strings
-
-    Examples
-    --------
-    >>> generate_keys("general design innovations limited liability company", "us", "")
-    ['c5:us_gener', 'ct:us_general', 'p6:genera', 'st:design_general']
-    >>> generate_keys("", "india", "kh no 570 new delhi west delhi delhi")
-    ['ca:india_kh no']
     """
     country = country_clean if country_clean else "xx"
     keys: list[str] = []
+    use_name = name_clean and len(name_clean) >= 3
 
-    if name_clean:
+    if use_name:
         tokens = name_clean.split()
 
-        # BK1: country + first 5 chars (more selective than 4)
+        # BK1: country + first 3 chars (broad, high recall)
+        prefix3 = name_clean[:3]
+        if len(prefix3) >= 2:
+            keys.append(f"c3:{country}_{prefix3}")
+
+        # BK2: country + first 5 chars (selective)
         prefix5 = name_clean[:5]
         if len(prefix5) >= 3:
             keys.append(f"c5:{country}_{prefix5}")
 
-        # BK2: country + first token with >= 5 chars
-        # Min length 5 skips common short words that create huge buckets:
-        # "ram", "new", "sri", "shri", "the", "co", etc.
-        first_tok = _first_significant_token(tokens, min_len=5)
+        # BK3: country + first token with >= 4 chars (relaxed from >=5)
+        first_tok = _first_significant_token(tokens, min_len=4)
         if first_tok:
             keys.append(f"ct:{country}_{first_tok}")
 
-        # BK3: first 6 chars, no country (cross-country bridge)
+        # BK4: first 6 chars, no country (cross-country bridge)
         prefix6 = name_clean[:6]
         if len(prefix6) >= 4:
             keys.append(f"p6:{prefix6}")
 
-        # BK4: sorted two significant tokens (min length 4)
-        sorted_tok = _sorted_two_tokens(tokens, min_len=4)
+        # BK5: sorted significant tokens (all tokens >= 3 chars, relaxed from >=4)
+        sorted_tok = _sorted_significant_tokens(tokens, min_len=3)
         if sorted_tok:
             keys.append(f"st:{sorted_tok}")
 
+        # BK6: country + Soundex of first meaningful token (phonetic matching)
+        soundex_src = first_tok if first_tok else (tokens[0] if tokens else "")
+        soundex_code = _soundex_key(soundex_src)
+        if soundex_code:
+            keys.append(f"ph:{country}_{soundex_code}")
+
     else:
-        # BK5: address-based fallback for records with no usable name
+        # Fallback: address-based keys for records with empty/very short name
         # (e.g. businesses whose name is entirely in Devanagari/Hindi script)
-        if address_clean:
-            addr_prefix = address_clean[:6].strip()
-            if len(addr_prefix) >= 4:
-                keys.append(f"ca:{country}_{addr_prefix}")
+        if address_clean and len(address_clean) >= 4:
+            addr_tokens = address_clean.split()
+
+            # BK8: country + first 6 chars of address_clean
+            addr_prefix6 = address_clean[:6].strip()
+            if len(addr_prefix6) >= 4:
+                keys.append(f"ca:{country}_{addr_prefix6}")
+
+            # BK9: country + first significant token of address_clean (>= 5 chars)
+            first_addr_tok = _first_significant_token(addr_tokens, min_len=5)
+            if first_addr_tok:
+                keys.append(f"at:{country}_{first_addr_tok}")
+
+            # BK10: first 7 chars of address_clean (country-agnostic)
+            addr_prefix7 = address_clean[:7].strip()
+            if len(addr_prefix7) >= 5:
+                keys.append(f"ap:{addr_prefix7}")
+
+    # BK7: country + first 4 chars of address (for ALL entities, noisy-name backup)
+    if address_clean and len(address_clean) >= 3:
+        addr_prefix4 = address_clean[:4]
+        keys.append(f"aa:{country}_{addr_prefix4}")
 
     # Remove duplicates while preserving order
     seen: set[str] = set()
@@ -212,6 +258,8 @@ def generate_keys(
             unique_keys.append(k)
 
     return unique_keys
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +281,7 @@ def build_inverted_index(
     ----------
     source_dfs  : list[pd.DataFrame]
         Normalized source DataFrames.  Must contain columns:
-        entity_id, name_clean, country_clean.
+        entity_id, name_clean, country_clean, address_clean.
     max_per_key : int
         Hard cap on how many entity IDs a single key may hold.
         Prevents hot keys from exploding candidate set sizes.
@@ -293,7 +341,8 @@ def generate_candidates(
     Parameters
     ----------
     s1_df : pd.DataFrame
-        Normalized Source-1.  Needs: entity_id, name_clean, country_clean.
+        Normalized Source-1.  Needs: entity_id, name_clean, country_clean,
+        address_clean.
     index : dict[str, set[str]]
         Inverted index from build_inverted_index().
     desc  : str
@@ -315,9 +364,10 @@ def generate_candidates(
         entity_id     = row.entity_id
         name_clean    = row.name_clean
         country_clean = row.country_clean
+        address_clean = row.address_clean
 
         merged: set[str] = set()
-        for key in generate_keys(name_clean, country_clean):
+        for key in generate_keys(name_clean, country_clean, address_clean):
             bucket = index.get(key)
             if bucket:
                 merged.update(bucket)
@@ -383,16 +433,16 @@ def evaluate_blocking(
     ----------------
     avg_candidates
         Average number of candidate IDs per Source-1 entity.
-        Measures the cost side of the trade-off.
 
     blocking_recall  (pair-level)
         Of all (S1, S2/S3) true-match pairs in the ground truth, what
         fraction have the S2/S3 ID present in the candidate list?
-        This is the most important metric: missing a true match here
-        means it can never be recovered in later ranking stages.
 
     entity_recall  (entity-level)
         Fraction of Source-1 entities where EVERY true match is covered.
+
+    zero_candidate_pct
+        Percentage of Source-1 entities that have 0 candidates.
 
     Parameters
     ----------
@@ -408,6 +458,10 @@ def evaluate_blocking(
     total_candidates = sum(len(v) for v in candidates.values())
     n_s1 = len(candidates)
     avg_candidates = total_candidates / n_s1 if n_s1 else 0.0
+
+    # Count zero-candidate entities
+    zero_candidates = sum(1 for v in candidates.values() if len(v) == 0)
+    zero_candidate_pct = zero_candidates / n_s1 * 100 if n_s1 else 0.0
 
     total_true = 0
     covered_true = 0
@@ -454,6 +508,8 @@ def evaluate_blocking(
         "entities_fully_covered":  entities_fully_covered,
         "entities_with_matches":   int(entities_with_matches),
         "total_s1_entities":       n_s1,
+        "zero_candidates":         zero_candidates,
+        "zero_candidate_pct":      zero_candidate_pct,
     }
 
 
@@ -467,6 +523,8 @@ def print_evaluation(metrics: dict) -> None:
     print(f"  Total candidates generated   : {metrics['total_candidates']:>10,}")
     print(f"  Blocking recall (pair-level) : {metrics['blocking_recall']*100:>9.2f}%")
     print(f"  Entity recall  (all covered) : {metrics['entity_recall']*100:>9.2f}%")
+    print(f"  Zero-candidate S1 entities   : {metrics['zero_candidates']:>10,}  "
+          f"({metrics['zero_candidate_pct']:.2f}%)")
     print(f"  ---")
     print(f"  True match pairs in GT       : {metrics['total_true_matches']:>10,}")
     print(f"  Covered by candidates        : {metrics['covered_matches']:>10,}")

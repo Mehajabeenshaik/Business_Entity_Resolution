@@ -39,8 +39,8 @@ if hasattr(sys.stdout, "reconfigure"):
 # Absolute path to the dataset root – adjust if your layout differs.
 _DATASET_ROOT = os.path.join(
     os.path.expanduser("~"),
-    "OneDrive", "Desktop",
-    "AML", "student_resource", "dataset",
+    "Downloads", "6ab10eb3b23ba_student_resource",
+    "student_resource", "dataset",
 )
 
 _TRAIN = os.path.join(_DATASET_ROOT, "train")
