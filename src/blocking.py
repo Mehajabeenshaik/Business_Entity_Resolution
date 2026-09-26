@@ -86,6 +86,20 @@ MAX_CANDIDATES_PER_KEY = 180
 # Blocking key generation
 # ---------------------------------------------------------------------------
 
+_LEADING_STOPWORDS = {"the", "a", "an"}
+
+def _strip_leading_stopword(name_clean: str) -> str:
+    """
+    Drop a single leading article ("the", "a", "an") so prefix keys
+    (c3/c5/p6) treat "The Home Depot" and "Home Depot" the same.
+    Only strips one leading stopword; leaves the rest of the string alone.
+    """
+    tokens = name_clean.split()
+    if tokens and tokens[0] in _LEADING_STOPWORDS and len(tokens) > 1:
+        return " ".join(tokens[1:])
+    return name_clean
+
+
 def _first_significant_token(tokens: list[str], min_len: int = 5) -> str:
     """
     Return the first token that is at least min_len characters long.
@@ -191,14 +205,15 @@ def generate_keys(
 
     if use_name:
         tokens = name_clean.split()
+        prefix_source = _strip_leading_stopword(name_clean)
 
         # BK1: country + first 3 chars (broad, high recall)
-        prefix3 = name_clean[:3]
+        prefix3 = prefix_source[:3]
         if len(prefix3) >= 2:
             keys.append(f"c3:{country}_{prefix3}")
 
         # BK2: country + first 5 chars (selective)
-        prefix5 = name_clean[:5]
+        prefix5 = prefix_source[:5]
         if len(prefix5) >= 3:
             keys.append(f"c5:{country}_{prefix5}")
 
@@ -208,7 +223,7 @@ def generate_keys(
             keys.append(f"ct:{country}_{first_tok}")
 
         # BK4: first 6 chars, no country (cross-country bridge)
-        prefix6 = name_clean[:6]
+        prefix6 = prefix_source[:6]
         if len(prefix6) >= 4:
             keys.append(f"p6:{prefix6}")
 

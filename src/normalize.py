@@ -55,7 +55,6 @@ ADDRESS_ABBREVS: dict[str, str] = {
     r"\brd\b":    "road",
     r"\bst\b":    "street",
     r"\bave\b":   "avenue",
-    r"\blvd\b":   "boulevard",     # already the short form of blvd
     r"\bblvd\b":  "boulevard",
     r"\bdr\b":    "drive",
     r"\bnr\b":    "near",
@@ -82,7 +81,7 @@ _ADDRESS_PATTERNS: list[tuple[re.Pattern, str]] = [
 ]
 
 # Single compiled pattern to remove non-alphanumeric, non-space characters.
-_PUNCTUATION_RE = re.compile(r"[^a-z0-9\s]")
+_PUNCTUATION_RE = re.compile(r"[!-\/:-@\[-`{-~]")
 
 # Single compiled pattern to collapse multiple spaces.
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -256,7 +255,7 @@ def _vectorized_clean(
         s = s.str.replace(pattern, replacement, regex=True)
 
     # Step 5: Remove punctuation / special chars (keep a-z, 0-9, space)
-    s = s.str.replace(r"[^a-z0-9\s]", " ", regex=True)
+    s = s.str.replace(r"[!-\/:-@\[-`{-~]", " ", regex=True)
 
     # Step 6: Collapse whitespace — vectorized
     s = s.str.replace(r"\s+", " ", regex=True).str.strip()
