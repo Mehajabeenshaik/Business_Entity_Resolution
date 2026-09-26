@@ -612,23 +612,42 @@ def run_blocking(
 
 def main() -> None:
     """
-    Full blocking run using the training split.
-    Execute with:  python src/blocking.py
+    Full blocking run on train or test split.
+    Execute with:
+        python -m src.blocking --split train
+        python -m src.blocking --split test
     """
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run blocking candidate generation.")
+    parser.add_argument(
+        "--split",
+        type=str,
+        choices=["train", "test"],
+        default="train",
+        help="Dataset split to run blocking on (train or test). Default: train",
+    )
+    args, _ = parser.parse_known_args()
+
     print("=" * 60)
-    print("  Blocking / Candidate Generation")
+    print(f"  Blocking / Candidate Generation ({args.split.upper()} split)")
     print("=" * 60)
 
-    # Load raw data
-    print("\n[1] Loading datasets ...")
-    s1 = load_source(FILE_PATHS["train_source1"], "train_source1")
-    s2 = load_source(FILE_PATHS["train_source2"], "train_source2")
-    s3 = load_source(FILE_PATHS["train_source3"], "train_source3")
-    gt = load_ground_truth(FILE_PATHS["train_ground_truth"])
-    print(f"  S1: {len(s1):,}  S2: {len(s2):,}  S3: {len(s3):,}  GT: {len(gt):,}")
-
-    # Run the full pipeline
-    run_blocking(s1, s2, s3, gt_df=gt, evaluate=True)
+    if args.split == "test":
+        print("\n[1] Loading test datasets ...")
+        s1 = load_source(FILE_PATHS["test_source1"], "test_source1")
+        s2 = load_source(FILE_PATHS["test_source2"], "test_source2")
+        s3 = load_source(FILE_PATHS["test_source3"], "test_source3")
+        print(f"  S1: {len(s1):,}  S2: {len(s2):,}  S3: {len(s3):,}")
+        run_blocking(s1, s2, s3, gt_df=None, evaluate=False)
+    else:
+        print("\n[1] Loading train datasets ...")
+        s1 = load_source(FILE_PATHS["train_source1"], "train_source1")
+        s2 = load_source(FILE_PATHS["train_source2"], "train_source2")
+        s3 = load_source(FILE_PATHS["train_source3"], "train_source3")
+        gt = load_ground_truth(FILE_PATHS["train_ground_truth"])
+        print(f"  S1: {len(s1):,}  S2: {len(s2):,}  S3: {len(s3):,}  GT: {len(gt):,}")
+        run_blocking(s1, s2, s3, gt_df=gt, evaluate=True)
 
     print("Done.")
 
