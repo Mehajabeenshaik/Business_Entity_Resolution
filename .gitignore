@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.env
+.venv/
+venv/
+dist/
+build/
+
+# Large output files (TSV can be hundreds of GB)
+output/
+
+# Dataset (raw data, not committed)
+dataset/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
