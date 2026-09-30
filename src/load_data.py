@@ -1,8 +1,8 @@
 """
 load_data.py
 ============
-Amazon ML Challenge 2026 - Business Entity Resolution
-------------------------------------------------------
+Multi-Source Record Linkage Pipeline
+--------------------------------------
 Utility module to load all dataset files (train + test) into pandas DataFrames
 and print key exploratory statistics.
 
@@ -255,7 +255,7 @@ def main() -> None:
     Run directly with:  python src/load_data.py
     """
     print("=" * 60)
-    print("  Amazon ML Challenge 2026 - Business Entity Resolution")
+    print("  Multi-Source Record Linkage Pipeline")
     print("  Dataset Explorer")
     print("=" * 60)
 

@@ -1,69 +1,81 @@
-# Business Entity Resolution — Amazon ML Challenge 2026
+# Multi-Source Record Linkage Pipeline
 
-> **A full end-to-end entity resolution pipeline** built for the Amazon ML Challenge 2026.
-> This is a detailed portfolio write-up that documents what was built, the real challenges encountered, and what should be done differently next time.
+> **An end-to-end scalable entity resolution system** that links business records across three independently-maintained data sources using a multi-key inverted-index blocking strategy and a CatBoost classifier with 47 hand-crafted similarity features.
+
+Built to handle **~12 million multilingual business records** across Latin, Devanagari, Cyrillic, and Arabic scripts.
 
 ---
 
 ## Table of Contents
 
-1. [Problem Statement](#1-problem-statement)
-2. [Dataset Scale](#2-dataset-scale)
+1. [What Is Entity Resolution?](#1-what-is-entity-resolution)
+2. [Dataset Overview](#2-dataset-overview)
 3. [Pipeline Architecture](#3-pipeline-architecture)
 4. [Module Breakdown](#4-module-breakdown)
 5. [Technical Challenges](#5-technical-challenges)
-6. [Results & Honest Assessment](#6-results--honest-assessment)
-7. [What Was Successfully Built](#7-what-was-successfully-built)
-8. [What Went Wrong & Why](#8-what-went-wrong--why)
-9. [Future Improvements](#9-future-improvements)
-10. [Setup & Usage](#10-setup--usage)
+6. [Blocking: v1 vs. v2 — The Core Fix](#6-blocking-v1-vs-v2--the-core-fix)
+7. [Results & Honest Learnings](#7-results--honest-learnings)
+8. [Future Improvements](#8-future-improvements)
+9. [Setup & Usage](#9-setup--usage)
 
 ---
 
-## 1. Problem Statement
+## 1. What Is Entity Resolution?
 
-Given three independent sources of business entity records, determine which records across Source 2 and Source 3 refer to the **same real-world business** as a record in Source 1.
+**Entity Resolution** (also called *Record Linkage* or *Deduplication*) is the problem of identifying which records across different datasets refer to the same real-world entity — despite spelling variations, abbreviations, missing fields, and data noise.
+
+This project tackles a **multi-source, cross-lingual** variant:
 
 | Source | Role |
 |--------|------|
-| **Source 1** | Deduplicated reference set (the "query") |
-| **Source 2** | Noisy external registry |
-| **Source 3** | Second noisy external registry |
+| **Source 1** | Deduplicated reference set ("the query set") |
+| **Source 2** | Independent external business registry (noisy) |
+| **Source 3** | Second independent external registry (noisy) |
 
-Each Source 1 entity may match **zero, one, or many** records from Sources 2 and 3. The submission format is:
+**Goal:** For each record in Source 1, find all records in Sources 2 and 3 that describe the same real-world business.
 
 ```
-source1_entity_id    matched_entity_ids
-S1-0001              S2-1234,S3-5678
-S1-0002              (empty — no match found)
+Source 1 entity:    "Acme Technologies Pvt Ltd"   | Mumbai, India
+                            ↓  matches?
+Source 2 entity:    "ACME Tech Private Limited"   | Mumbai, MH, India   ✓ MATCH
+Source 3 entity:    "Acme Technologies"           | Pune, India          ? MAYBE
+Source 2 entity:    "Acme Chemicals Ltd"          | Delhi, India         ✗ NO MATCH
 ```
 
-### Evaluation Metric: Macro F0.5
-
-The challenge is scored using **macro-averaged F0.5**, computed independently per Source 1 entity and then averaged.
-
-$$F_{0.5} = \frac{(1 + 0.5^2) \cdot P \cdot R}{0.5^2 \cdot P + R} = \frac{1.25 \cdot P \cdot R}{0.25 \cdot P + R}$$
-
-F0.5 **weights precision twice as heavily as recall**. This means:
-- A **false positive** (predicting a wrong match) is penalized much more than a **false negative** (missing a true match).
-- Predicting nothing (empty output) scores 0 on entities with matches — but at least avoids false positives on entities with no match.
-- Threshold selection is therefore critical and heavily biased toward precision.
+This is a hard problem because:
+- The same business can be spelled many different ways across sources
+- Abbreviations differ: "Pvt Ltd" vs "Private Limited" vs "P. Ltd."
+- Addresses are noisy and inconsistently formatted
+- ~12 million records — brute-force pairwise comparison ≈ 22 billion pairs
 
 ---
 
-## 2. Dataset Scale
+## 2. Dataset Overview
 
-| Dataset | Approx. Rows |
-|---------|-------------|
-| Source 1 (train) | ~2.2 million |
-| Source 2 (train) | ~5 million |
-| Source 3 (train) | ~5 million |
-| Ground Truth (train) | ~2.2 million |
-| Source 1 (test) | ~2.2 million |
+| Split | Source 1 | Source 2 | Source 3 |
+|-------|----------|----------|----------|
+| Train | ~2.2M    | ~5M      | ~5M      |
+| Test  | ~2.2M    | ~5M      | ~5M      |
 
-Total data across all sources: **~12 million business records**, spanning multiple countries with names in Latin, Devanagari (Hindi), Cyrillic, Arabic, and other scripts.
+**Schema** (all source files):
 
-A **full O(n × m) pairwise comparison** between Source 1 and Sources 2+3 would require evaluating ~22 billion pairs — completely infeasible. This made the **blocking** (candidate generation) stage the most critical architectural decision.
+```
+entity_id | business_name | business_address | country
+```
+
+**Ground truth** (train only):
+
+```
+source1_entity_id | matched_entity_ids   (comma-separated list)
+```
+
+### Data Challenges
+
+- **Scale**: 12M+ total records — row-by-row Python operations are a non-starter
+- **Multilingual names**: significant portions in Devanagari (Hindi), Cyrillic, Arabic, Chinese
+- **Noisy addresses**: inconsistent formatting, missing fields, different transliterations
+- **Many-to-many matches**: a single Source 1 entity may match 0, 1, or many records
+- **Class imbalance**: true matches are a tiny fraction of all possible pairs (< 0.001%)
 
 ---
 
@@ -74,37 +86,37 @@ Raw TSV Files (S1, S2, S3)
          │
          ▼
   ┌─────────────┐
-  │  load_data  │  — Load TSVs, print EDA statistics
+  │  load_data  │  ── Load TSVs, EDA stats, path config
   └──────┬──────┘
          │
          ▼
   ┌─────────────┐
-  │  normalize  │  — Unicode NFKD, diacritic removal, abbreviation
-  └──────┬──────┘    expansion, lowercasing, punctuation stripping
+  │  normalize  │  ── Unicode NFKD, diacritic strip, abbreviation
+  └──────┬──────┘     expansion, lowercase, punctuation removal
+         │
+         ▼
+  ┌─────────────┐    10 complementary key types (BK1–BK10)
+  │  blocking   │  ── Multi-key inverted index → candidate_pairs.tsv
+  └──────┬──────┘    Per-key cap: 60  |  Per-entity cap: 80
          │
          ▼
   ┌─────────────┐
-  │  blocking   │  — Multi-key inverted index → candidate_pairs.tsv
-  └──────┬──────┘    (BK1–BK10: prefix, phonetic, address, token-sort)
+  │  features   │  ── 47 pairwise similarity features per (S1, candidate)
+  └──────┬──────┘     RapidFuzz + custom token/digit/address metrics
          │
          ▼
   ┌─────────────┐
-  │  features   │  — 47 pairwise similarity features per (S1, candidate)
-  └──────┬──────┘    pair using RapidFuzz + custom token/digit metrics
+  │   train     │  ── CatBoost classifier, grouped split (no leakage)
+  └──────┬──────┘     Threshold search optimising macro-F0.5
          │
          ▼
   ┌─────────────┐
-  │   train     │  — CatBoost classifier, grouped train/val split,
-  └──────┬──────┘    F0.5-optimized threshold search (0.50→0.99)
-         │
-         ▼
-  ┌─────────────┐
-  │   predict   │  — Score test candidates, apply threshold,
-  └──────┬──────┘    write matching_results.tsv
+  │   predict   │  ── Score test candidates → matching_results.tsv
+  └──────┬──────┘
          │
          ▼
   ┌──────────────────┐
-  │  validate_output │  — Strict submission format validator
+  │  validate_output │  ── Strict submission format validator
   └──────────────────┘
 ```
 
@@ -113,178 +125,208 @@ Raw TSV Files (S1, S2, S3)
 ## 4. Module Breakdown
 
 ### `src/load_data.py`
-- Loads all 7 TSV files (3 train sources, ground truth, 3 test sources) into pandas DataFrames.
-- Path configurable via `AML_DATASET_ROOT` environment variable.
-- Prints EDA: dataset shapes, unique country distributions, ground truth match-count histogram.
+Loads all 7 TSV files into pandas DataFrames. Path configurable via the
+`RECORD_LINKAGE_DATASET_ROOT` environment variable. Prints EDA statistics:
+shapes, unique country distributions, match-count histogram from ground truth.
 
 ### `src/normalize.py`
-Vectorized text cleaning pipeline for business names, addresses, and countries:
-1. **Unicode NFKD normalization** — decompose and strip diacritic marks (e.g. `"Café"` → `"Cafe"`).
-2. **Non-Latin fallback** — for scripts like Devanagari (Hindi) that become empty after ASCII stripping, the original text is preserved so blocking keys can still be generated.
-3. **Abbreviation expansion** — `"Ltd"` → `"limited"`, `"Pvt"` → `"private"`, `"Rd"` → `"road"`, etc. Applied *before* punctuation removal so word boundaries work correctly.
-4. **Punctuation removal** — retain only `[a-z0-9 ]`.
-5. **Whitespace collapse** — squeeze and strip.
+Fully **vectorized** text cleaning pipeline (no row-by-row `.apply()` bottlenecks):
 
-All operations use **pandas vectorized str methods** (C-speed) instead of row-by-row `.apply()` for scalability across millions of rows.
+| Step | Operation |
+|------|-----------|
+| 1 | Unicode NFKD normalization — decompose + strip diacritic marks |
+| 2 | Non-Latin fallback — if ASCII stripping empties the string (e.g. Hindi), keep original |
+| 3 | Lowercase |
+| 4 | Abbreviation expansion — `"Ltd"→"limited"`, `"Rd"→"road"`, etc. (before punctuation removal so `\b` works) |
+| 5 | Punctuation removal — keep only `[a-z0-9 ]` |
+| 6 | Whitespace collapse — strip and squeeze |
 
 ### `src/blocking.py`
-The most critical and complex module. Generates a small set of candidate matches for each Source 1 entity using a **multi-key inverted index** to avoid an O(n×m) brute-force search.
 
-**10 Complementary Blocking Keys (BK1–BK10):**
+The most critical module. Generates a compact candidate set for each Source 1 entity using a **multi-key inverted index** — the only viable approach at this scale.
 
-| Key | Tag | Strategy |
-|-----|-----|----------|
-| BK1 | `c3:` | country + first 3 chars of name (broad recall) |
-| BK2 | `c5:` | country + first 5 chars of name (higher precision) |
-| BK3 | `ct:` | country + first significant token (≥4 chars) |
-| BK4 | `p6:` | first 6 chars of name, **no country** (cross-country bridge) |
-| BK5 | `st:` | sorted significant tokens, word-order invariant |
-| BK6 | `ph:` | country + Soundex of first token (phonetic/spelling variants) |
-| BK7 | `aa:` | country + first 4 chars of address (noisy-name backup, all entities) |
-| BK8 | `ca:` | country + first 6 chars of address (non-Latin fallback) |
-| BK9 | `at:` | country + first significant address token (non-Latin fallback) |
-| BK10 | `ap:` | first 7 chars of address, no country (non-Latin fallback) |
+**10 Blocking Keys (v2, precision-first design):**
 
-Each key bucket is **capped at 180 entities** (`MAX_CANDIDATES_PER_KEY`) to suppress runaway hot-keys (e.g. `"c3:india_pri"` would match hundreds of thousands of "Private Ltd" companies).
+| Key | Tag | Strategy | Added/Changed |
+|-----|-----|----------|---------------|
+| BK1 | `c5:` | country + first **5** chars | Was 3 chars in v1 — biggest explosion source |
+| BK2 | `c7:` | country + first **7** chars | New in v2 |
+| BK3 | `ct:` | country + first token ≥ **5** chars | Raised from 4 chars |
+| BK4 | `p7:` | first **7** chars, no country | Raised from 6 chars |
+| BK5 | `st:` | sorted tokens ≥ **4** chars | Raised from 3 chars |
+| BK6 | `ph:` | country + Soundex of first token | Unchanged |
+| BK7 | `aa:` | country + first 6 chars of address | **Conditional** (weak name only) |
+| BK8 | `ca:` | country + first 6 chars of address | Non-Latin fallback |
+| BK9 | `at:` | country + first significant address token | Non-Latin fallback |
+| BK10 | `ap:` | first 7 chars of address | Non-Latin fallback |
 
-Also includes a blocking **evaluation harness** measuring:
-- Pair-level blocking recall (fraction of true-match pairs covered by candidates)
-- Entity-level recall (fraction of S1 entities where ALL true matches are in candidates)
-- Average candidates per entity
-- Zero-candidate rate
+**Two-level caps:**
+- `MAX_CANDIDATES_PER_KEY = 60` — stops hot-key buckets from dominating
+- `MAX_TOTAL_CANDIDATES = 80` — hard cap per entity after unioning all keys
+
+Also includes a **blocking evaluation harness** that measures pair-level and entity-level recall against ground truth, so you know your recall ceiling before training.
 
 ### `src/features.py`
-Builds a **47-feature vector** for each (Source 1, candidate) pair:
+Builds a **47-feature vector** for each `(Source 1, candidate)` pair using RapidFuzz (C-speed):
 
-| Group | Features |
-|-------|---------|
-| **Name similarity** (16) | Exact match, Jaro-Winkler WRatio, Levenshtein, ratio, partial ratio, token sort, token set, Jaccard, containment, shared token count, first/last token match, prefix-4 match, length diff/ratio, digit Jaccard |
-| **Address similarity** (14) | Same metrics as name + house number match, PIN/postal code match |
-| **Country features** (5) | Exact match, conflict flag, both present, S1 missing, candidate missing |
-| **Source/blocking context** (3) | Is S2 / Is S3 / total candidates for this S1 entity |
-| **Combined interactions** (9) | name×addr product, sum, min, max; high-name+same-country; high-addr+same-country; exact-name+exact-country; exact-addr+exact-country; both-high |
+| Feature Group | Count | Examples |
+|---------------|-------|---------|
+| Name similarity | 16 | Jaro-Winkler WRatio, Levenshtein, token sort/set ratio, Jaccard, prefix-4 match, digit Jaccard |
+| Address similarity | 14 | Same + house number match, postal code match |
+| Country features | 5 | Exact match, conflict flag, missingness indicators |
+| Source/context | 3 | Is S2 / Is S3 / total candidates for this entity |
+| Interaction features | 9 | name×addr, same_country_high_name, exact_name_exact_country, etc. |
 
-Feature order is **fixed and serialized** to `artifacts/features/feature_columns.json` to guarantee train/val/test consistency.
+Feature order is fixed and serialized to `artifacts/features/feature_columns.json` to prevent train/test skew.
 
 ### `src/train.py`
-- Loads candidate pairs from `output/candidate_pairs.tsv` (produced by blocking on the train split).
-- Labels pairs as match (1) or non-match (0) using ground truth.
-- **Down-samples negatives** to 5:1 ratio (negatives:positives) per S1 entity to keep training feasible.
-- **Grouped train/val split** (`GroupShuffleSplit` by `source1_entity_id`) — ensures no S1 entity appears in both train and validation to prevent leakage.
-- Trains a **CatBoost classifier** (3000 iterations, depth=8, lr=0.05, early stopping=80 rounds) and an **sklearn HistGBM baseline**.
-- **Threshold search** over [0.50, 0.99] on validation macro-F0.5 to select the optimal decision boundary.
-- Saves model, config, selected threshold, feature importance, and validation metrics to `artifacts/`.
+- Loads `candidate_pairs.tsv` (train blocking output)
+- Labels pairs as match/non-match from ground truth
+- **5:1 negative downsampling** per entity to keep training feasible
+- **Grouped train/val split** (`GroupShuffleSplit` by `source1_entity_id`) — no leakage
+- Trains **CatBoost** (3000 iter, depth=8, lr=0.05, early stopping)
+- **Threshold sweep** [0.50, 0.99] on validation macro-F0.5 to pick optimal decision boundary
+- Saves model, threshold, feature importance, and metrics to `artifacts/`
 
 ### `src/predict.py`
-Loads the saved CatBoost model and threshold, scores all test candidates, and writes `output/matching_results.tsv`.
+Loads saved model + threshold, scores test candidates, writes `matching_results.tsv`.
 
 ### `src/evaluate.py`
-Full evaluation on training ground truth: reports macro-F0.5, macro-precision, macro-recall, number of entities, and blocking recall ceiling.
+Full eval on training ground truth: macro-F0.5 / precision / recall + blocking recall ceiling.
 
 ### `src/validate_output.py`
-Strict submission file validator — checks format, column names, entity ID coverage, and value types.
+Strict submission file validator — checks format, column names, entity coverage, value types.
 
 ### `fast_submit.py`
-Emergency submission utility that was used for the actual final submission. Merges existing predictions with the complete list of test entity IDs to ensure no entity is missing from the output file.
+Utility that merges existing predictions with the full list of Source 1 IDs to ensure no entity is missing from the output (a submission requirement).
 
 ---
 
 ## 5. Technical Challenges
 
-### 5.1 Candidate Explosion (The Core Bottleneck)
+### 5.1 Candidate Explosion — The Core Scalability Problem
 
-The biggest problem encountered was that blocking keys were **too permissive**, producing a `candidate_pairs.tsv` file of **~5.3 GB**. At 12 million+ total records, even a conservative average of ~2,400 candidates per Source 1 entity results in billions of pairwise feature computation calls.
+The first version of the blocking module produced a **5.3 GB** `candidate_pairs.tsv`.
+At ~2.2M Source 1 entities this means ~2,400 candidates per entity on average, which makes feature extraction and training completely infeasible.
 
-**Impact:** CatBoost training never completed because the feature matrix alone — even before training — was too large to fit in RAM and took too long to compute. This meant the primary ML approach could not be evaluated at all on the test set.
+**Root causes:**
+1. `c3:` key (country + 3-char prefix) was catastrophically broad. The key `"c3:india_pri"` alone matched hundreds of thousands of "Private Ltd" companies — the most common business type in India.
+2. `aa:` key (address, 4-char prefix) was applied to **all** entities, not just those with weak names — flooding every well-named entity with noisy address-based candidates.
+3. Per-key bucket cap of 180 was too large: 10 keys × 180 = 1,800 worst-case candidates per entity.
+4. No total-per-entity cap: the union of all keys had no bound.
 
-**Root cause:** The `c3:` (country + 3-char prefix) and `aa:` (country + 4-char address prefix) keys produce very large buckets for common business naming patterns (e.g., most Indian businesses share the prefix `"pri"` for "Private Limited"). Even with the 180-entity per-key cap, the union across 6+ keys per entity still explodes.
+**Fix:** See [Blocking v2](#6-blocking-v1-vs-v2--the-core-fix) below.
 
 ### 5.2 Non-Latin Business Names
 
-India-based records (a significant portion of the dataset) often have business names in **Devanagari/Hindi script**. After NFKD normalization and ASCII stripping, these names become empty strings, making all name-based blocking keys useless.
+India accounts for a major portion of the dataset; many business names are in **Devanagari/Hindi script**. After NFKD normalization and ASCII stripping, these names become empty strings — making all name-based blocking keys useless.
 
-**Mitigation:** Implemented fallback address-based blocking keys (BK8–BK10) and preserved original text when ASCII stripping yields nothing. However, the address field is also often in Devanagari or missing, making these records very hard to match without script-aware normalization.
+**Mitigation:**
+- Detect when ASCII stripping empties the string; preserve original text so the record at least has something
+- BK8–BK10 address fallback keys activate automatically for any entity where `name_clean` is too short
+- True fix would require romanization/transliteration of Devanagari (see Future Improvements)
 
-### 5.3 F0.5 Precision Bias
+### 5.3 Precision-Weighted Metric
 
-The metric strongly punishes false positives. This creates a dilemma:
-- **Aggressive blocking** (high recall) → more candidates → more false positives from the classifier → lower F0.5
-- **Conservative blocking** (fewer candidates) → fewer false positives → but also misses true matches → zero coverage score
+The evaluation metric is **macro-F0.5** — precision weighted twice as heavily as recall:
 
-The optimal strategy would be very selective blocking with a high-precision classifier. Getting that balance right requires iteration, which ran out of time for.
+$$F_{0.5} = \frac{1.25 \cdot P \cdot R}{0.25 \cdot P + R}$$
 
-### 5.4 Scale vs. Iteration Speed
+This means adding a wrong match hurts roughly twice as much as missing a correct one.
+The optimal strategy is therefore **precision-first blocking**: a smaller, cleaner candidate set is better than a larger, noisier one.
 
-With ~2.2M Source 1 entities and a 5.3 GB candidate file, even a single pass over the data takes 30–60+ minutes. This severely limits the ability to iterate on hyperparameters or blocking strategies during a time-limited competition.
+### 5.4 Iteration Speed at Scale
 
----
-
-## 6. Results & Honest Assessment
-
-| Metric | Value |
-|--------|-------|
-| **Final submission** | RapidFuzz token-set ranking (fast_submit.py), not the trained model |
-| **Competition score** | Close to "predict nothing" baseline |
-| **Why** | Candidate explosion prevented CatBoost training from completing; fallback used simple fuzzy ranking without any trained threshold |
-
-The final score was low, but that does **not** mean the engineering effort was wasted. The pipeline is correct in design — the failure was a resource/time management problem, not an algorithmic one.
-
-The "predict nothing" baseline gets a non-zero score only on entities that genuinely have no matches (predicting empty is correct for those). For entities that do have matches, an empty prediction gives F0.5 = 0. The final submission was marginally better in some buckets but similarly hurt by over-prediction in others.
+With 2.2M entities and a 5 GB candidate file, a single pipeline run (blocking + feature extraction + training) takes hours. This makes hyperparameter tuning and blocking strategy experimentation very slow — a key lesson about building **fast evaluation loops** before scaling up.
 
 ---
 
-## 7. What Was Successfully Built
+## 6. Blocking: v1 vs. v2 — The Core Fix
 
-✅ **Complete ETL pipeline** — loads, validates, and normalizes 12M+ multilingual records.
+This section documents the most important engineering change in the project.
 
-✅ **Production-quality blocking module** — 10 complementary key types, inverted index, hot-key capping, thorough evaluation harness (pair-level + entity-level recall).
+### What changed
 
-✅ **47-feature pairwise feature engineering** — name, address, country, source context, and interaction features using RapidFuzz at C-speed.
+| Parameter | v1 (broken) | v2 (fixed) | Impact |
+|-----------|-------------|------------|--------|
+| 3-char prefix key (`c3:`) | **Present** | **Removed** | Biggest single source of explosion |
+| 5-char prefix key (`c5:`) | Present | Present (now BK1) | Kept — good precision |
+| 7-char prefix key (`c7:`) | Absent | **Added** | New high-precision key |
+| First token min length | 4 chars | **5 chars** | Excludes common 4-letter words |
+| Prefix key width (`p6/p7`) | 6 chars | **7 chars** | More selective |
+| Sorted token min length | 3 chars | **4 chars** | Excludes "the", "and", "for" |
+| Address key (BK7) scope | ALL entities | **Weak-name only** | Eliminates noise for well-named entities |
+| Max per-key bucket | **180** | **60** | 3× fewer candidates from hot buckets |
+| Max total per entity | None | **80** | Hard guarantee on output size |
 
-✅ **CatBoost training scaffold** — grouped cross-validation, negative downsampling, F0.5-optimized threshold search, feature importance logging.
+### Why these specific numbers
 
-✅ **Full evaluation harness** — computes macro-F0.5/P/R at any threshold, blocking recall ceiling, and validation summary.
+- **5-char prefix** is the sweet spot for business names: it's selective enough to exclude generic word-starts ("manuf", "trade") but broad enough to tolerate small OCR errors.
+- **60 per-key cap**: any blocking key with >60 matching entities is a stop-word by another name. Keeping them adds noise, not signal.
+- **80 per-entity cap**: at 2.2M entities × 80 candidates × ~50 bytes per ID, the output file is ~8.8 GB theoretical maximum — practically much less since most entities produce far fewer candidates. This guarantees a tractable file.
 
-✅ **Submission validator** — strict format checking before submission.
+### Expected improvement
 
-✅ **Non-Latin text handling** — Devanagari fallback strategy, original-text preservation on ASCII-empty strings.
-
-✅ **Windows/UTF-8 compatibility** — explicit stdout reconfiguration to avoid cp1252 crashes on Hindi/Arabic names.
-
----
-
-## 8. What Went Wrong & Why
-
-| Problem | Root Cause | Effect |
-|---------|-----------|--------|
-| 5.3 GB candidate file | BK1 (`c3:`) + BK7 (`aa:`) too permissive for generic prefixes | Could not complete feature extraction or training |
-| No trained model in final submission | Candidate explosion → OOM / timeout | Fell back to unsophisticated fuzzy ranking |
-| Low score | Fallback had no learned threshold, no precision control | Many false positives; score near baseline |
-
----
-
-## 9. Future Improvements
-
-### Immediate Fixes (would have the most impact)
-
-1. **Tighten blocking** — Remove or heavily restrict `c3:` (3-char prefix) and `aa:` (4-char address). Switch `c3:` to `c5:` only, raise token minimum lengths. Target ≤ 200 average candidates per entity.
-2. **Streaming feature extraction** — Process candidate pairs in chunks of ~500K rows; write feature batches to disk; train on partial data if necessary.
-3. **Lighter model** — Use HistGBM or even logistic regression with the 47 features. Faster to train, easier to iterate. Switch to CatBoost only for final refinement.
-4. **Blocking recall audit** — Before training, verify that the blocking recall on train ground truth is ≥ 90%. If the true matches are not in the candidate set, no classifier can find them.
-
-### Longer-term Improvements
-
-5. **Script-aware normalization** — Use `langdetect` + transliteration libraries (`indic-transliteration`, `arabic-transliterator`) to romanize non-Latin names before blocking.
-6. **Faiss/approximate nearest-neighbor blocking** — Embed business names with a light multilingual embedding (e.g. LaBSE or sentence-transformers) and use Faiss for approximate k-NN candidate retrieval. Scales much better than prefix keys for multilingual data.
-7. **Learning-to-match model** — Fine-tune a small cross-encoder (e.g. `paraphrase-multilingual-MiniLM`) on the (name1, name2, match) pairs instead of hand-crafted features.
-8. **Proper negative mining** — Use hard negatives from blocking (high-similarity non-matches) rather than random sampling to improve model discrimination.
-9. **Ensemble** — Combine CatBoost predictions with a lightweight Jaccard/BM25 score as a prior for better calibration.
+| Metric | v1 | v2 (estimated) |
+|--------|----|----------------|
+| Avg candidates per entity | ~2,400 | ~50–80 |
+| Output file size | 5.3 GB | ~200–400 MB |
+| Feature matrix rows (train) | Billions | ~100–200M |
+| CatBoost trainable? | ❌ No | ✅ Yes |
 
 ---
 
-## 10. Setup & Usage
+## 7. Results & Honest Learnings
 
-### Installation
+### What was built and ran successfully
+- Complete ETL, normalization, and blocking pipeline
+- 47-feature pairwise feature engineering (RapidFuzz-based)
+- CatBoost training scaffold with grouped validation and F0.5 threshold search
+- Blocking evaluation harness (recall ceiling measurement)
+- Submission format validator
+
+### What didn't work
+The v1 blocking produced a 5.3 GB candidate file. This made feature extraction and CatBoost training infeasible to complete within available memory and time. The final output was generated using a lightweight fuzzy-ranking fallback (`fast_submit.py`) rather than the trained classifier — resulting in a score close to the "predict nothing" baseline.
+
+### Key Learnings
+
+1. **Measure your blocking recall ceiling first.** Before spending time on features and training, verify that the true matches are actually in your candidate set. A classifier cannot find matches that blocking missed.
+
+2. **Precision-first blocking is correct for precision-weighted metrics.** It feels counterintuitive, but a smaller, cleaner candidate set produces better downstream precision than a large, noisy one — even if recall drops slightly.
+
+3. **Build a fast end-to-end loop before scaling.** Running the full pipeline on a 1% sample would have revealed the candidate explosion in minutes rather than hours.
+
+4. **Candidate count statistics are your first health check.** Average candidates per entity, max candidates, and 99th-percentile candidates are cheap to compute and immediately reveal blocking quality problems.
+
+5. **UTF-8 is not optional for multilingual data.** On Windows, stdout defaults to cp1252 — without explicit reconfiguration, any Hindi or Arabic character in a print statement crashes the process silently.
+
+---
+
+## 8. Future Improvements
+
+### Immediate (high impact)
+
+1. **Run blocking v2** — validate that average candidates are in the 50–80 range and blocking recall stays above 85% on the train ground truth.
+2. **Streaming feature extraction** — process candidate pairs in chunks of ~500K and write feature matrices to disk (HDF5 or numpy memmap). Avoid loading the full feature matrix into RAM.
+3. **Faster baseline first** — train HistGBM or Logistic Regression on a 10% data sample to get a quick validation score before waiting for full CatBoost training.
+
+### Algorithmic improvements
+
+4. **Script-aware normalization** — romanize non-Latin scripts using `indic-transliteration` (Hindi), `arabic-transliterator`, `unidecode` as a fallback. This would make BK1–BK6 effective for the currently-untreatable Devanagari/Arabic records.
+5. **ANN-based blocking with multilingual embeddings** — embed business names using [LaBSE](https://huggingface.co/sentence-transformers/LaBSE) or `paraphrase-multilingual-MiniLM-L12-v2`, then use Faiss for approximate nearest-neighbour candidate retrieval. Language-agnostic and scales sub-linearly.
+6. **Hard negative mining** — the current negative sampling is random. Mine hard negatives (high-similarity non-matches like "Acme Chemicals" vs "Acme Technologies") to force the model to learn finer discrimination.
+7. **Cross-encoder reranking** — for the top-K candidates per entity, use a small fine-tuned cross-encoder to rerank and filter, leveraging the full text pair rather than fixed features.
+
+### System improvements
+
+8. **Multiprocessing for feature extraction** — the pairwise feature loop is embarrassingly parallel. Use `multiprocessing.Pool` or Dask to saturate all CPU cores.
+9. **Profile hot-key distribution** — log the 100 most common blocking keys and their bucket sizes after building the index. This reveals data-distribution pathologies before they cause downstream problems.
+
+---
+
+## 9. Setup & Usage
+
+### Requirements
 
 ```bash
 pip install -r requirements.txt
@@ -292,38 +334,57 @@ pip install -r requirements.txt
 
 ### Dataset Path
 
-Place the dataset at `~/Downloads/6ab10eb3b23ba_student_resource/student_resource/dataset/` or set:
+Set the root directory of the dataset:
 
 ```bash
 # Linux / macOS
-export AML_DATASET_ROOT="/path/to/student_resource/dataset"
+export RECORD_LINKAGE_DATASET_ROOT="/path/to/dataset"
 
 # Windows (PowerShell)
-$env:AML_DATASET_ROOT = "C:\path\to\student_resource\dataset"
+$env:RECORD_LINKAGE_DATASET_ROOT = "C:\path\to\dataset"
 ```
 
-### Running the Full Pipeline
+Expected layout:
+
+```
+dataset/
+    train/
+        train_source1.tsv
+        train_source2.tsv
+        train_source3.tsv
+        train_ground_truth.tsv
+    test/
+        test_source1.tsv
+        test_source2.tsv
+        test_source3.tsv
+```
+
+### Full Pipeline
 
 ```bash
 # 1. Explore dataset statistics
 python -m src.load_data
 
-# 2. Run blocking on train split (generates candidate_pairs.tsv)
+# 2. Run blocking on train split
+#    → output/candidate_pairs.tsv
 python -m src.blocking --split train
 
-# 3. Train the CatBoost model
+# 3. Train CatBoost model, run threshold search
+#    → artifacts/model/  and  artifacts/validation/
 python -m src.train
 
 # 4. Evaluate on train ground truth
 python -m src.evaluate
 
-# 5. Run blocking on test split (overwrites candidate_pairs.tsv)
+# 5. Run blocking on test split
+#    → output/candidate_pairs.tsv  (overwrites train candidates)
 python -m src.blocking --split test
 
 # 6. Generate test predictions
+#    → output/matching_results.tsv
 python -m src.predict
 
-# 7. Validate submission format
+# 7. Validate output format
 python -m src.validate_output
 ```
 
@@ -331,24 +392,24 @@ python -m src.validate_output
 
 ```
 src/
-    load_data.py        # TSV loading, EDA helpers, path configuration
-    normalize.py        # Vectorized text cleaning, diacritic/abbreviation handling
-    blocking.py         # Multi-key inverted index blocking (BK1–BK10)
+    load_data.py        # TSV loading, EDA, path config
+    normalize.py        # Vectorized multilingual text cleaning
+    blocking.py         # Multi-key inverted index, v2 precision-first design
     features.py         # 47 pairwise similarity features
-    train.py            # CatBoost + HistGBM training, F0.5 threshold search
-    evaluate.py         # Full eval on train ground truth, blocking recall ceiling
+    train.py            # CatBoost + HistGBM, grouped CV, F0.5 threshold search
+    evaluate.py         # Full evaluation + blocking recall ceiling
     predict.py          # Score test candidates → matching_results.tsv
-    validate_output.py  # Submission format validator
+    validate_output.py  # Output format validator
     main.py             # Pipeline orchestrator
-fast_submit.py          # Emergency submission fixer (used for final submission)
+fast_submit.py          # Emergency merge utility (ensures all S1 IDs are in output)
 output/
-    candidate_pairs.tsv      # Generated by blocking.py
-    matching_results.tsv     # Final predictions
-    matching_results_FIXED.tsv  # Submission with all S1 entity IDs present
+    candidate_pairs.tsv        # From blocking.py
+    matching_results.tsv       # From predict.py
+    matching_results_FIXED.tsv # From fast_submit.py
 artifacts/
-    model/                   # CatBoost model, config, threshold
-    features/                # Feature column definitions
-    validation/              # Metrics, threshold sweep, feature importance
+    model/          # CatBoost model (.cbm), config, threshold
+    features/       # Feature column definitions (JSON)
+    validation/     # Threshold sweep CSV, feature importance, eval metrics
 requirements.txt
 ```
 
@@ -358,14 +419,14 @@ requirements.txt
 
 | Library | Purpose |
 |---------|---------|
-| `pandas` | Tabular data loading and vectorized string ops |
-| `numpy` | Feature matrix construction and threshold search |
-| `rapidfuzz` | C-level fuzzy string matching (Levenshtein, Jaro-Winkler, token ratios) |
-| `catboost` | Primary gradient-boosted classifier with native categorical support |
-| `scikit-learn` | HistGBM baseline, grouped cross-validation split |
+| `pandas` ≥ 2.0 | Vectorized string operations on millions of rows |
+| `numpy` | Feature matrix construction, threshold grid search |
+| `rapidfuzz` ≥ 3.0 | C-level Levenshtein, Jaro-Winkler, token ratios |
+| `catboost` ≥ 1.2 | Primary gradient-boosted classifier |
+| `scikit-learn` ≥ 1.3 | HistGBM baseline, GroupShuffleSplit |
 | `jellyfish` | Soundex phonetic encoding for blocking key BK6 |
-| `tqdm` | Progress bars for long-running loops |
+| `tqdm` | Progress bars for long-running data loops |
 
 ---
 
-*This project was built as part of the Amazon ML Challenge 2026 and is maintained as a learning portfolio artifact. The pipeline design is production-ready; the competition outcome reflects the realities of working with internet-scale, multilingual, noisy entity data under time pressure.*
+*This project explores the engineering tradeoffs in large-scale entity resolution: the tension between blocking recall and precision, the scalability limits of inverted-index approaches, and the challenge of matching multilingual business names at internet scale.*
