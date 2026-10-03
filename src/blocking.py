@@ -81,9 +81,16 @@ Expected impact
   entities lose no recall since c5/c7 keys are strictly more selective but
   equally precise.
 
+Sample Mode (--sample N)
+------------------------
+Runs blocking on only the first N Source-1 entities while still building the
+inverted index from the full S2+S3 corpus.  Useful for quick iteration when
+the full candidate file is too large to process (e.g. 16 GB).
+
 Output
 ------
-output/candidate_pairs.tsv
+output/candidate_pairs.tsv           (full run)
+output/candidate_pairs_sample.tsv    (sample run, --sample N)
     source1_entity_id <TAB> candidate_entity_ids (comma-separated)
     One row per Source-1 entity.  Empty string when no candidates found.
 """
@@ -117,7 +124,8 @@ if hasattr(sys.stdout, "reconfigure"):
 # ---------------------------------------------------------------------------
 
 OUTPUT_DIR  = os.path.join(os.path.dirname(__file__), "..", "output")
-OUTPUT_FILE = os.path.join(OUTPUT_DIR, "candidate_pairs.tsv")
+OUTPUT_FILE        = os.path.join(OUTPUT_DIR, "candidate_pairs.tsv")
+OUTPUT_FILE_SAMPLE = os.path.join(OUTPUT_DIR, "candidate_pairs_sample.tsv")
 
 # Per-bucket cap: keys whose bucket exceeds this size are treated as
 # stop-words.  Reduced from 180 → 60 to cut candidate volume aggressively.
@@ -651,6 +659,7 @@ def run_blocking(
     gt_df: pd.DataFrame | None = None,
     output_path: str = OUTPUT_FILE,
     evaluate: bool = True,
+    sample_n: int | None = None,
 ) -> dict[str, list[str]]:
     """
     End-to-end blocking pipeline: normalize -> index -> candidates -> save.
@@ -662,9 +671,14 @@ def run_blocking(
     gt_df : pd.DataFrame or None
         Training ground truth.  Pass None to skip evaluation.
     output_path : str
-        Where to write candidate_pairs.tsv.
+        Where to write the candidate TSV file.
     evaluate : bool
         Whether to run evaluate_blocking() after generating candidates.
+    sample_n : int or None
+        If set, slice Source 1 to the first sample_n rows before generating
+        candidates.  The inverted index is still built from the full S2+S3
+        corpus so blocking recall is realistic.  When None, all Source 1
+        entities are processed.
 
     Returns
     -------
@@ -678,6 +692,12 @@ def run_blocking(
     print("[Normalize] Source 3 ...")
     s3_norm = normalize_dataframe(s3_df)
 
+    # Apply sample AFTER normalization so the output columns are guaranteed
+    if sample_n is not None:
+        total_s1 = len(s1_norm)
+        s1_norm = s1_norm.iloc[:sample_n].reset_index(drop=True)
+        print(f"\n[Sample] Using first {len(s1_norm):,} of {total_s1:,} Source-1 entities.")
+
     print("\n[Index] Building inverted index from Source 2 + Source 3 ...")
     index = build_inverted_index([s2_norm, s3_norm])
     n_keys = len(index)
@@ -687,14 +707,40 @@ def run_blocking(
           f"(cap: {MAX_TOTAL_CANDIDATES} per entity) ...")
     candidates = generate_candidates(s1_norm, index)
 
-    # Print quick stats before evaluation
+    # ---- Stats printout ----
     total_cands = sum(len(v) for v in candidates.values())
-    avg = total_cands / len(candidates) if candidates else 0
-    print(f"  Total candidates: {total_cands:,}  |  Avg per entity: {avg:.1f}")
+    n_entities  = len(candidates)
+    avg         = total_cands / n_entities if n_entities else 0.0
+    max_cands   = max((len(v) for v in candidates.values()), default=0)
+    zero_cands  = sum(1 for v in candidates.values() if not v)
+
+    # Estimate output file size: each candidate ID is ~10 bytes, comma + newline overhead
+    bytes_estimate = total_cands * 12 + n_entities * 20
+    mb_estimate    = bytes_estimate / 1024 / 1024
+    gb_estimate    = mb_estimate / 1024
+
+    print(f"\n  {'Entities processed':<30}: {n_entities:>10,}")
+    print(f"  {'Total candidates':<30}: {total_cands:>10,}")
+    print(f"  {'Avg candidates per entity':<30}: {avg:>10.1f}")
+    print(f"  {'Max candidates (any entity)':<30}: {max_cands:>10,}")
+    print(f"  {'Zero-candidate entities':<30}: {zero_cands:>10,}  ({zero_cands/n_entities*100:.1f}%)")
+    if gb_estimate >= 1.0:
+        print(f"  {'Estimated file size':<30}: {gb_estimate:>9.2f} GB")
+    else:
+        print(f"  {'Estimated file size':<30}: {mb_estimate:>9.1f} MB")
 
     if evaluate and gt_df is not None:
-        print("\n[Evaluate] Measuring blocking quality ...")
-        metrics = evaluate_blocking(candidates, gt_df)
+        # Filter ground truth to only the sampled S1 entities so recall
+        # numbers are correctly scoped to the sample, not the full dataset.
+        if sample_n is not None:
+            sampled_ids = set(s1_norm["entity_id"])
+            gt_scoped   = gt_df[gt_df["source1_entity_id"].isin(sampled_ids)].copy()
+            print(f"\n[Evaluate] Measuring blocking quality on {len(gt_scoped):,} "
+                  f"ground-truth rows (sample scope) ...")
+        else:
+            gt_scoped = gt_df
+            print("\n[Evaluate] Measuring blocking quality ...")
+        metrics = evaluate_blocking(candidates, gt_scoped)
         print_evaluation(metrics)
 
     print("[Save] Writing output file ...")
@@ -705,14 +751,28 @@ def run_blocking(
 
 def main() -> None:
     """
-    Full blocking run on train or test split.
-    Execute with:
+    Full or sample blocking run on train or test split.
+
+    Usage examples
+    --------------
+    # Full run on training split (slow, builds full candidate file):
         python -m src.blocking --split train
+
+    # Sample run — first 50,000 Source-1 entities, outputs candidate_pairs_sample.tsv:
+        python -m src.blocking --split train --sample 50000
+
+    # Sample run on test split (for debugging predict.py):
+        python -m src.blocking --split test --sample 50000
+
+    # Full test run (for final submission):
         python -m src.blocking --split test
     """
     import argparse
 
-    parser = argparse.ArgumentParser(description="Run blocking candidate generation.")
+    parser = argparse.ArgumentParser(
+        description="Run blocking candidate generation (full or sample mode).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument(
         "--split",
         type=str,
@@ -720,10 +780,32 @@ def main() -> None:
         default="train",
         help="Dataset split to run blocking on (train or test). Default: train",
     )
+    parser.add_argument(
+        "--sample",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Sample mode: use only the first N Source-1 entities. "
+            "The full S2+S3 index is still built, so recall estimates are realistic. "
+            "Output goes to candidate_pairs_sample.tsv. "
+            "Example: --sample 50000"
+        ),
+    )
     args, _ = parser.parse_known_args()
+
+    sample_n    = args.sample
+    is_sample   = sample_n is not None
+    output_path = OUTPUT_FILE_SAMPLE if is_sample else OUTPUT_FILE
 
     print("=" * 60)
     print(f"  Blocking / Candidate Generation ({args.split.upper()} split)")
+    if is_sample:
+        print(f"  MODE: SAMPLE  (first {sample_n:,} Source-1 entities)")
+        print(f"  Output: candidate_pairs_sample.tsv")
+    else:
+        print(f"  MODE: FULL")
+        print(f"  Output: candidate_pairs.tsv")
     print(f"  MAX_CANDIDATES_PER_KEY = {MAX_CANDIDATES_PER_KEY}")
     print(f"  MAX_TOTAL_CANDIDATES   = {MAX_TOTAL_CANDIDATES}")
     print("=" * 60)
@@ -734,7 +816,13 @@ def main() -> None:
         s2 = load_source(FILE_PATHS["test_source2"], "test_source2")
         s3 = load_source(FILE_PATHS["test_source3"], "test_source3")
         print(f"  S1: {len(s1):,}  S2: {len(s2):,}  S3: {len(s3):,}")
-        run_blocking(s1, s2, s3, gt_df=None, evaluate=False)
+        run_blocking(
+            s1, s2, s3,
+            gt_df=None,
+            evaluate=False,
+            output_path=output_path,
+            sample_n=sample_n,
+        )
     else:
         print("\n[1] Loading train datasets ...")
         s1 = load_source(FILE_PATHS["train_source1"], "train_source1")
@@ -742,9 +830,20 @@ def main() -> None:
         s3 = load_source(FILE_PATHS["train_source3"], "train_source3")
         gt = load_ground_truth(FILE_PATHS["train_ground_truth"])
         print(f"  S1: {len(s1):,}  S2: {len(s2):,}  S3: {len(s3):,}  GT: {len(gt):,}")
-        run_blocking(s1, s2, s3, gt_df=gt, evaluate=True)
+        run_blocking(
+            s1, s2, s3,
+            gt_df=gt,
+            evaluate=True,
+            output_path=output_path,
+            sample_n=sample_n,
+        )
 
-    print("Done.")
+    print("\nDone.")
+    if is_sample:
+        print(f"  Sample output: {os.path.abspath(output_path)}")
+        print(f"  Next step (train on sample):")
+        print(f"    set CAND_PATH in src/train.py to candidate_pairs_sample.tsv")
+        print(f"    python -m src.train")
 
 
 if __name__ == "__main__":
